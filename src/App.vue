@@ -159,14 +159,17 @@
 </template>
 
 <script setup>
-import {computed, reactive, watch} from 'vue';
+import { computed, reactive, watch } from 'vue';
+import { useSvgDimensions } from '@/composables/useSvgDimensions';
 
 import Hero from "@/components/Hero.vue";
 import CodeBlock from "@/components/CodeBlock.vue";
 
+/* ---------------- STATE ---------------- */
+
 const svg = reactive({
   code: '',
-  fill: `currentColor`,
+  fill: 'currentColor',
   preview: '',
 
   width: null,
@@ -175,247 +178,285 @@ const svg = reactive({
   downloadFormat: 'svg',
 
   isValidSVG: true,
-})
+});
 
-// Watch for SVG code changes
-watch(() => svg.code, (svgCodeValue) => {
-  svgCodeValue = svgCodeValue.toString().trim();
-  svg.isValidSVG = isValidSVG(svgCodeValue);
+useSvgDimensions(svg);
 
-  if (!svg.isValidSVG) {
-    // invalid SVG
+/* ---------------- DOM HELPERS ---------------- */
 
+const parseSvg = (code) => {
+  const parser = new DOMParser();
+  const doc = parser.parseFromString(code, 'image/svg+xml');
+  const svgEl = doc.documentElement;
+
+  if (svgEl.tagName.toLowerCase() !== 'svg') return null;
+  if (doc.querySelector('parsererror')) return null;
+
+  return { doc, svgEl };
+};
+
+const serializeSvg = (doc) => doc.documentElement.outerHTML;
+
+/* ---------------- VALIDATION + READ ---------------- */
+
+watch(() => svg.code, (value) => {
+  const parsed = parseSvg(value?.trim());
+  svg.isValidSVG = !!parsed;
+
+  if (!parsed) {
     svg.fill = 'currentColor';
     svg.width = null;
     svg.height = null;
-
     return;
   }
 
-  const fillMatches = [...svgCodeValue.matchAll(/\bfill=['"](#[0-9a-fA-F]{3,8}|[a-zA-Z]+|rgba?\([^)]*\))['"]/gmi)];
-  const fillValue = fillMatches.map(m => m[1])[0];
+  const { svgEl } = parsed;
 
-  if (fillValue) {
-    svg.fill = fillValue;
+  svg.width = svgEl.getAttribute('width');
+  svg.height = svgEl.getAttribute('height');
+
+  // Read first fill found
+  const fillNode = svgEl.querySelector('[fill]');
+  if (fillNode) {
+    svg.fill = fillNode.getAttribute('fill');
   }
-
-  // Extract width and height attributes
-  const widthMatch = svgCodeValue.match(/\bwidth=['"]([\d.]+)['"]/);
-  const heightMatch = svgCodeValue.match(/\bheight=['"]([\d.]+)['"]/);
-
-  svg.width = widthMatch?.[1] || null;
-  svg.height = heightMatch?.[1] || null;
 });
 
-// Watch svg fill color
-watch(() => svg.fill, (fillColor) => {
-  svg.code = svg.code.toString().replace(/fill=['"](.*?)['"]/gmi, `fill="${fillColor}"`);
-});
+/* ---------------- FILL HANDLING ---------------- */
 
-// Watch for width changes
-watch(() => svg.width, (newWidth) => {
-  const width = newWidth?.toString().trim() || null;
-  let svgCode = svg.code.toString();
+watch(() => svg.fill, (color) => {
+  if (!svg.code || !svg.isValidSVG) return;
 
-  if (width && svg.aspectRatio) {
-    svg.height = width;
+  const parsed = parseSvg(svg.code);
+  if (!parsed) return;
+
+  const { doc, svgEl } = parsed;
+
+  // 1. <svg fill="">
+  if (svgEl.hasAttribute('fill') && svgEl.getAttribute('fill') !== 'none') {
+    svgEl.setAttribute('fill', color);
   }
+  // 2. descendant fill
+  else {
+    const fillEls = svgEl.querySelectorAll('[fill]:not([fill="none"])');
 
-  // Remove width & height if width is null
-  if (!width) {
-    svgCode = svgCode.replace(/\b width=['"][^'"]+['"]/gi, '');
-
-    if (svg.aspectRatio) {
-      svgCode = svgCode.replace(/\b height=['"][^'"]+['"]/gi, '');
+    if (fillEls.length) {
+      fillEls.forEach(el => el.setAttribute('fill', color));
     }
+    // 3. <svg stroke="">
+    else if (svgEl.hasAttribute('stroke') && svgEl.getAttribute('stroke') !== 'none') {
+      svgEl.setAttribute('stroke', color);
+    }
+    // 4. descendant stroke
+    else {
+      const strokeEls = svgEl.querySelectorAll('[stroke]:not([stroke="none"])');
 
-    svg.code = svgCode;
-    return;
+      if (strokeEls.length) {
+        strokeEls.forEach(el => el.setAttribute('stroke', color));
+      }
+      // 5. fallback → inject fill
+      else {
+        svgEl.setAttribute('fill', color);
+      }
+    }
   }
 
-  // Update or insert width
-  svg.code = svgCode.includes('width=')
-    ? svgCode.replace(/\bwidth=['"]\d+['"]/gi, `width="${width}"`)
-    : svgCode.replace('<svg', `<svg width="${width}"`);
+  svg.code = serializeSvg(doc);
 });
 
-// Watch for height changes
-watch(() => svg.height, (newHeight) => {
-  const height = newHeight?.toString().trim() || null;
-  let svgCode = svg.code.toString();
 
-  // Remove height if null
-  if (!height) {
-    svg.code = svgCode.replace(/\bheight=['"][^'"]+['"]/gi, '');
-    return;
-  }
-
-  const hasWidth = svgCode.includes('width=');
-  const hasHeight = svgCode.includes('height=');
-
-  // Update or set width value
-  if (hasHeight) {
-    svg.code = svgCode.replace(/height=['"]\d+['"]/gmi, `height="${height}"`);
-  } else if (hasWidth) {
-    svg.code = svgCode.replace(/width=['"](.*?)['"]/gmi, `width="$1" height="${height}"`);
-  } else {
-    svg.code = svgCode.replace('<svg', `<svg height="${height}"`);
-  }
-});
+/* ---------------- MINIFY (SAFE) ---------------- */
 
 const minifySVG = () => {
-  svg.code = svg.code.toString()
-    .replace(/>\s+</g, '><')  // Remove spaces between HTML tags
-    .replace(/\s{2,}/g, ' ')  // Replace multiple spaces with a single space
-    .replace(/(.*?)><\/path>/gi, '$1/>') // end path tag
-    .replace(/<!--.*?-->/gs, '')  // Remove HTML comments
+  if (!svg.code) return;
+
+  const parsed = parseSvg(svg.code);
+  if (!parsed) return;
+
+  svg.code = serializeSvg(parsed.doc)
+    .replace(/>\s+</g, '><')
+    .replace(/\s{2,}/g, ' ')
+    .replace(/<!--.*?-->/gs, '')
     .trim();
-}
+};
+
+/* ---------------- DERIVED OUTPUTS ---------------- */
 
 const mergeSvgPaths = computed(() => {
-  let all = [];
+  if (!svg.code || !svg.isValidSVG) return '';
 
-  return svg.code.toString()
-    .replace(/<path[^>]*d="([^"]+)"[^>]*>/g, (_, d) => {
-      all.push(d);
-      return '';
-    })
-    .replace(/<\/svg>/, `<path d="${all.join(' ')}"/></svg>`);
+  const parsed = parseSvg(svg.code);
+  if (!parsed) return '';
+
+  const { doc, svgEl } = parsed;
+  const paths = [...svgEl.querySelectorAll('path')]
+    .map(p => p.getAttribute('d'))
+    .filter(Boolean);
+
+  svgEl.querySelectorAll('path').forEach(p => p.remove());
+
+  const merged = doc.createElementNS('http://www.w3.org/2000/svg', 'path');
+  merged.setAttribute('d', paths.join(' '));
+  svgEl.appendChild(merged);
+
+  return serializeSvg(doc);
 });
 
 const getSymbolSVG = computed(() => {
-  return svg.code.toString()
-    .replaceAll('<svg ', '<symbol id="symbol-id" ')
-    .replaceAll('</svg>', '</symbol>');
+  if (!svg.code || !svg.isValidSVG) return '';
+
+  const parsed = parseSvg(svg.code);
+  if (!parsed) return '';
+
+  const { doc, svgEl } = parsed;
+
+  const symbol = doc.createElementNS(svgEl.namespaceURI, 'symbol');
+  symbol.setAttribute('id', 'symbol-id');
+
+  [...svgEl.attributes].forEach(attr => {
+    if (!['width', 'height', 'xmlns'].includes(attr.name)) {
+      symbol.setAttribute(attr.name, attr.value);
+    }
+  });
+
+  symbol.innerHTML = svgEl.innerHTML;
+  return symbol.outerHTML;
 });
 
-const getSymbolUseSVG = computed(() => {
-  return `
-  <svg class="icon">
-    <use xlink:href="#symbol-id"></use>
-  </svg>`;
-});
+const getSymbolUseSVG = computed(() => `
+<svg class="icon">
+  <use xlink:href="#symbol-id"></use>
+</svg>
+`.trim());
+
+/* ---------------- FILL COLOR PICKER ---------------- */
+
+const getSvgPaintColor = (svgCode) => {
+  const parsed = parseSvg(svgCode);
+  if (!parsed) return null;
+
+  const { svgEl } = parsed;
+
+  // 1. <svg fill="">
+  const svgFill = svgEl.getAttribute('fill');
+  if (svgFill && svgFill !== 'none') {
+    return svgFill;
+  }
+
+  // 2. descendant fill
+  const fillEl = svgEl.querySelector('[fill]:not([fill="none"])');
+  if (fillEl) {
+    return fillEl.getAttribute('fill');
+  }
+
+  // 3. <svg stroke="">
+  const svgStroke = svgEl.getAttribute('stroke');
+  if (svgStroke && svgStroke !== 'none') {
+    return svgStroke;
+  }
+
+  // 4. descendant stroke
+  const strokeEl = svgEl.querySelector('[stroke]:not([stroke="none"])');
+  if (strokeEl) {
+    return strokeEl.getAttribute('stroke');
+  }
+
+  return null;
+};
+
 
 const getFillColor = computed(() => {
-  const color = svg.fill.toString();
-
-  // currentColor fill
-  if (color === 'currentColor') {
+  if (!svg.code || !svg.isValidSVG) {
     return '#000000';
   }
 
-  // Handle short hex (e.g., #FFF -> #FFFFFF)
-  if (/^#([a-fA-F0-9]){3}$/.test(color)) {
-    return '#' + color.slice(1).split('').map(c => c + c).join('');
+  const color = getSvgPaintColor(svg.code);
+
+  console.log('color', color);
+
+  // currentColor → fallback for picker
+  if (!color || color === 'currentColor') {
+    return '#000000';
   }
 
-  // Handle full hex (e.g., #FFFFFF)
-  if (/^#([a-fA-F0-9]){6}$/.test(color)) {
+  // Normalize HEX
+  if (/^#([a-fA-F0-9]{3})$/.test(color)) {
+    return (
+      '#' +
+      color
+        .slice(1)
+        .split('')
+        .map(c => c + c)
+        .join('')
+    ).toUpperCase();
+  }
+
+  if (/^#([a-fA-F0-9]{6})$/.test(color)) {
     return color.toUpperCase();
   }
 
-  // Handle named colors
-  const ctx = document.createElement('canvas').getContext('2d');
-  ctx.fillStyle = color;
-  const hex = ctx.fillStyle;
-  if (/^#[a-fA-F0-9]{6}$/.test(hex)) {
-    return hex.toUpperCase();
-  }
+  // Named colors / rgb / others → let browser normalize ONCE
+  const tmp = document.createElement('div');
+  tmp.style.color = color;
+  document.body.appendChild(tmp);
 
-  // Handle rgb formats (rgb(0,0,0) and variations)
-  const rgbMatch = color.match(/^rgb\(?\s*(\d+)\s*,?\s*(\d+)\s*,?\s*(\d+)\s*\)?$/);
-  if (rgbMatch) {
-    return '#' + rgbMatch.slice(1, 4)
+  const computed = getComputedStyle(tmp).color;
+  document.body.removeChild(tmp);
+
+  const rgb = computed.match(/\d+/g);
+  if (!rgb) return '#000000';
+
+  return (
+    '#' +
+    rgb
+      .slice(0, 3)
       .map(n => (+n).toString(16).padStart(2, '0'))
       .join('')
-      .toUpperCase();
-  }
+  ).toUpperCase();
+});
 
-  return svg.fill;
-})
-
-const isValidSVG = (svgString) => {
-  try {
-    const parser = new DOMParser();
-    const doc = parser.parseFromString(svgString, "image/svg+xml");
-    const isParseError = doc.querySelector("parsererror");
-    return !isParseError && doc.documentElement.tagName.toLowerCase() === "svg";
-  } catch (error) {
-    return false;
-  }
-}
+/* ---------------- DOWNLOAD ---------------- */
 
 const downloadImage = () => {
-  let format = svg.downloadFormat.toString();
-  let svgCode = svg.code.toString().trim();
+  if (!svg.code || !svg.isValidSVG) return;
 
+  let format = svg.downloadFormat.toLowerCase();
   const width = svg.width || 512;
   const height = svg.height || 512;
 
-  format = format.toLowerCase();
+  let svgCode = svg.code;
 
-  // Ensure SVG has namespace
-  if (!svgCode.includes('xmlns=')) {
+  if (!svgCode.includes('xmlns')) {
     svgCode = svgCode.replace('<svg', '<svg xmlns="http://www.w3.org/2000/svg"');
   }
 
-  // Download directly if format is SVG
   if (format === 'svg') {
-    const svgBlob = new Blob([svgCode], { type: 'image/svg+xml' });
-    const url = URL.createObjectURL(svgBlob);
-    triggerDownload(url, `image.${format}`);
+    const blob = new Blob([svgCode], { type: 'image/svg+xml' });
+    triggerDownload(URL.createObjectURL(blob), 'image.svg');
     return;
   }
 
-  // Encode SVG to Data URL
-  const encodedSvg = encodeURIComponent(svgCode).replace(/%20/g, ' ');
-  const dataUrl = `data:image/svg+xml;charset=utf-8,${encodedSvg}`;
-
-  // Create an Image element
   const img = new Image();
-  img.crossOrigin = 'anonymous';
-  img.src = dataUrl;
+  img.src = `data:image/svg+xml;charset=utf-8,${encodeURIComponent(svgCode)}`;
 
   img.onload = () => {
-    // Create a canvas
     const canvas = document.createElement('canvas');
     canvas.width = width;
     canvas.height = height;
-    const ctx = canvas.getContext('2d');
 
-    // Draw the SVG onto the canvas
-    ctx.drawImage(img, 0, 0, width, height);
+    canvas.getContext('2d').drawImage(img, 0, 0, width, height);
 
-    // Convert canvas to the specified format
-    canvas.toBlob(
-      (blob) => {
-        if (!blob) {
-          console.error('Error creating image blob.');
-          return;
-        }
-        const imageUrl = URL.createObjectURL(blob);
-        triggerDownload(imageUrl, `image.${format}`);
-      },
-      `image/${format === 'jpg' ? 'jpeg' : format}`,
-      1.0 // Quality for lossy formats
-    );
+    canvas.toBlob(blob => {
+      triggerDownload(URL.createObjectURL(blob), `image.${format}`);
+    }, `image/${format === 'jpg' ? 'jpeg' : format}`);
   };
+};
 
-  img.onerror = (error) => {
-    console.error('Error loading SVG image.', error);
-  };
-}
-
-// Helper function to trigger download
-function triggerDownload(url, filename) {
+const triggerDownload = (url, name) => {
   const a = document.createElement('a');
   a.href = url;
-  a.download = filename;
-  document.body.appendChild(a);
+  a.download = name;
   a.click();
-  document.body.removeChild(a);
   URL.revokeObjectURL(url);
-}
-
-
+};
 </script>

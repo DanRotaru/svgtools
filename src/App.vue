@@ -372,8 +372,6 @@ const getFillColor = computed(() => {
 
   const color = getSvgPaintColor(svg.code);
 
-  console.log('color', color);
-
   // currentColor → fallback for picker
   if (!color || color === 'currentColor') {
     return '#000000';
